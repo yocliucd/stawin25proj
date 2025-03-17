@@ -1,0 +1,827 @@
+---
+title: "Design and Construction of a Predictive Model Simulating Mouse Responses to Stimuli"
+author: Youchuan Li
+date: "17 March 2025"
+output:
+  html_document:
+    number_sections: true
+---
+
+# Abstract
+
+A 2019 study by Nicholas A Steinmetz et al. experimented to determine which mouse brain regions were active in visual-spatial decision-making. Mice had to turn a wheel in the correct direction to receive a water reward by comparing two image contrasts. We reproduced the corresponding neural decision-making process by constructing a predictive model in R. Using Steinmetz’s experimental data, we conducted some exploratory analysis showing trends corresponding to successes in neural and contrast data. These trends revealed a relationship between contrast size and neural activity with success rate. Then, we constructed and trained our model with data from the sessions. Our final model predicted whether an experimental trial resulted in success or failure based on the type of stimulus, with an accuracy of approximately 78%.
+
+# Introduction
+
+In the 2019 article “Distributed coding of choice, action, and engagement across the mouse brain,” researcher Nicholas A. Steinmetz and his team studied perceptual decision-making in mice. They defined this decision-making as the process of collecting sensory information, processing the information to choose an action, and performing an appropriate action. To do so, the researchers recorded the neuronal activity of mice as they completed a task integrating the three steps of perceptual decision-making. The mice needed to compare two images to their right and left with different contrast levels to receive a water reward. Depending on the contrast difference, they needed to turn a wheel correspondingly. The researchers used equal contrasts as a negative control, randomly choosing the correct direction. They used a Neuropixel probe to assess 30,000 neurons in 42 regions during the trials. The experiment produced a data set containing 9,538 trials across 39 sessions with 10 mice. Each trial recorded the contrasts of both images, whether the mouse succeeded, and neural activity formatted as spike trains.
+
+We were interested in designing and implementing a machine-learning model that can predict the outcome of any given experimental trial by taking the trial’s neural activity and contrasts as input. For simplicity, we used a truncated data set containing only the first 18 sessions. Furthermore, we only followed four mice (Cori, Forssman, Hench, and Lederberg) and used spike train data from stimuli onset to 0.4 seconds after onset. We used this data for both precursory analysis and training. The completed model simulated perceptual decision-making in mice performing an experimental trial. We first conducted some exploratory data analysis on Steinmetz’s data to determine how to construct our model. We designed our final model correspondingly after finding trends linking neural activity and contrast differences with trial success. We also found that the different mice demonstrated different neural reactions in these trials, but these trends were consistent for trials in general. Likewise, later sessions were compared to earlier sessions. After training the model and running some preliminary testing, we assessed model performance using 100 trials selected from Sessions 1 and 18, for 200 total trials.
+
+# Exploratory Data Analysis
+
+```{r,echo=FALSE,results='hide',warning=FALSE,message=FALSE}
+library(data.table)
+library("kernlab")
+library(tidyverse)
+library(tree)
+library("caret")
+library(kableExtra)
+library(dplyr)
+library(glmnet)
+library(class)
+library(MASS)
+session=list()
+for(i in 1:18){
+  session[[i]]=readRDS(paste('./session',i,'.rds',sep=''))
+  #print(session[[i]]$mouse_name)
+  #print(session[[i]]$date_exp)
+}
+svf = function(sid, sind){
+  specific_session = list()
+  specific_session[[1]] = session[[sid]]$contrast_left[[sind]]
+  specific_session[[2]] = session[[sid]]$contrast_right[[sind]]
+  specific_session[[3]] = session[[sid]]$feedback[[sind]]
+  specific_session[[4]] = session[[sid]]$spks[[sind]]
+  specific_session[[5]] = session[[sid]]$time[[sind]]
+  return(specific_session)
+}
+graph_svf = function(sid, sind, output_image=FALSE){
+  svf_input = svf(sid, sind)
+  x_list = c()
+  y_list = c()
+  row_count = 1
+  svf_input = svf_input[[4]]
+  for (column_number in 1:ncol(svf_input)){
+    for (row_number in 1:nrow(svf_input)){
+      if(svf_input[row_number,column_number] == 1) {
+        x_list = append(x_list,column_number)
+        y_list = append(y_list,row_number)
+      }
+    }
+  }
+  matrix_output = matrix(list(),nrow=2,ncol=1)
+  matrix_output[[1,1]] = scale(x_list)
+  matrix_output[[2,1]] = scale(y_list)
+ #filename = paste("neuron_plot",sid,"to",sind,".png")
+  title = paste("Neuronal Activity (Session ",sid,", Trial ",sind,")",sep = "")
+ #png(file = filename)
+  if(output_image){
+    plot(y_list~x_list,main=title,ylab="Neuron",xlab="Time")
+  }
+ #dev.off()
+  return(matrix_output)
+}
+success_svf = function(start_ind, end_ind, whether_all = FALSE){
+  x_success = c()
+  y_success = c()
+  x_failure = c()
+  y_failure = c()
+  session_name = session[[start_ind]]$mouse_name
+  for(i in start_ind:end_ind){
+    for(trial in 1:length((session[[i]]$contrast_left))){
+      entry = graph_svf(i,trial)
+      if(session[[i]]$feedback_type[[trial]]==1){
+        x_success = append(x_success,entry[[1,1]])
+        y_success = append(y_success,entry[[2,1]])
+      } else {
+        x_failure = append(x_failure,entry[[1,1]])
+        y_failure = append(y_failure,entry[[2,1]])
+      }
+    }
+  }
+  if(whether_all){
+    session_name = "All"
+  }
+  plot(y_success~x_success,pch=16,col=alpha("black",0.01),main=paste("Successful Trials (",session_name,")",sep=""),ylab="Neuron",xlab="Time")
+  plot(y_failure~x_failure,pch=16,col=alpha("black",0.01),main=paste("Failed Trials (",session_name,")",sep=""),ylab="Neuron",xlab="Time")
+
+}
+```
+
+As described earlier, the entire data set consisted of 39 sessions containing 9,538 trials in total. Each trial recorded the mouse’s bane, the neuron spike trains, the image contrasts, the brain area of each neuron, and the trial's outcome. Thus, every session had six variables. The spike trains were formatted as arrays, with rows representing one of the neurons of interest and columns representing time bins. The spike trains represented the mice’s neural activity as chronologically ordered neuron spikes from left to right. Each spike train only contained data for neurons probed during the trial. The left and right contrasts took values from 0 to 1 in increments of 0.25, where 0 represented no contrast and 1 represented maximum contrast. Finally, in the outcome field, successful trials were indicated with “1,” and negative trials were indicated with “-1”.
+
+Because our reduced data set had only 18 sessions, we analyzed 5,081 trials across four mice: Coris, Forssman, Hench, and Lederberg. Of the four mice within these trials, the first three sessions corresponded to Cori, the following four corresponded to Forssman, the following four corresponded to Hench, and the remaining sessions corresponded to Lederberg. Cori had 593 trials, Forssman had 1,045 trials, Hench had 1,411 trials, and Lederberg had 2,032 trials. The number of neurons observed in each trial varied, ranging from 474 to 1769, depending on the trial and the mouse.
+
+Our first exploratory step was to visualize some aspects of the data. Because we were primarily interested in contrasts, feedback, and neural spike trains, we focused on those variables. Due to the complexity of the spike trains, we began with feedback. We believed that because contrast was an explanatory variable in the original study with deliberately chosen values, studying its distribution would be less valuable than focusing on its effect on the other two variables of interest. Thus, we first plotted the total number of successes and failures for each session and each mouse.
+
+```{r, fig.show="hold", out.width="50%",echo=FALSE,results='hide', cache = TRUE}
+successes_count = c()
+failures_count = c()
+session_count = c(1:18)
+trials_count = c()
+averages_count = c()
+faverages_count = c()
+
+for(i in 1:18) {
+  success_count = 0
+  failure_count = 0
+  trial_count = 0
+  for(trial in 1:length(session[[i]]$contrast_left)){
+    if(session[[i]]$feedback_type[[trial]] == 1){
+      success_count = success_count + 1
+    } else {
+      failure_count = failure_count + 1
+    }
+    trial_count = trial_count + 1
+  }
+  successes_count = c(successes_count,success_count)
+  failures_count = c(failures_count,failure_count)
+  trials_count = c(trials_count,trial_count)
+  averages_count = c(averages_count,success_count/trial_count)
+  faverages_count = c(faverages_count,failure_count/trial_count)
+}
+```
+
+```{r, fig.show="hold",echo=FALSE,results='hide', cache = TRUE}
+barplot(trials_count~session_count,ylab="Total Trials",xlab="Session",main="Trials per Session")
+```
+```{r, fig.show="hold", out.width="50%",echo=FALSE,results='hide', cache = TRUE}
+barplot(successes_count~session_count,ylab="Successes",xlab="Session",main="Successes by Session")
+barplot(failures_count~session_count,ylab="Failures",xlab="Session",main="Failures by Session")
+
+barplot(successes_count[1:3]~c(1:3),ylab="Successes",xlab="Session",main="Successes by Session (Cori)")
+barplot(failures_count[1:3]~c(1:3),ylab="Failures",xlab="Session",main="Failures by Session (Cori)")
+
+barplot(successes_count[4:7]~c(1:4),ylab="Successes",xlab="Session",main="Successes by Session (Forssmann)")
+barplot(failures_count[4:7]~c(1:4),ylab="Failures",xlab="Session",main="Failures by Session (Forssmann)")
+
+barplot(successes_count[8:11]~c(1:4),ylab="Successes",xlab="Session",main="Successes by Session (Hench)")
+barplot(failures_count[8:11]~c(1:4),ylab="Failures",xlab="Session",main="Failures by Session (Hench)")
+
+barplot(successes_count[12:18]~c(1:7),ylab="Successes",xlab="Session",main="Successes by Session (Lederberg)")
+barplot(failures_count[12:18]~c(1:7),ylab="Failures",xlab="Session",main="Failures by Session (Lederberg)")
+```
+
+Because we culled 100 trials from both Sessions 1 and 18, they had fewer trials than any other sessions for the same mouse. We found that the number of successes per session generally increased over time, except for Lederberg, where it decreased, and the number of failures per session fluctuated. However, there was also fluctuation in the number of trials per session. Therefore, we plotted each mouse's average success and failure rates for a more accurate picture of the data.
+
+```{r, fig.show="hold", out.width="50%",echo=FALSE,results='hide', cache = TRUE}
+barplot(averages_count[1:3]~c(1:3),ylab="Successes",xlab="Session",main="Average Successes by Session (Cori)")
+barplot(faverages_count[1:3]~c(1:3),ylab="Failures",xlab="Session",main="Average Failures by Session (Cori)")
+
+barplot(averages_count[4:7]~c(1:4),ylab="Successes",xlab="Session",main="Average Successes by Session (Forssmann)")
+barplot(faverages_count[4:7]~c(1:4),ylab="Failures",xlab="Session",main="Average Failures by Session (Forssmann)")
+
+barplot(averages_count[8:11]~c(1:4),ylab="Successes",xlab="Session",main="Average Successes by Session (Hench)")
+barplot(faverages_count[8:11]~c(1:4),ylab="Failures",xlab="Session",main="Average Failures by Session (Hench)")
+
+barplot(averages_count[12:18]~c(1:7),ylab="Successes",xlab="Session",main="Average Successes by Session (Lederberg)")
+barplot(faverages_count[12:18]~c(1:7),ylab="Failures",xlab="Session",main="Average Failures by Session (Lederberg)")
+```
+
+We found that average successes generally increased throughout the sessions
+
+Our next step was visualizing the neural data. We decided to begin by plotting spike trains as scatterplots of activity against time, where activity was represented by a value corresponding to a neuron in the spike train, and the time index of the spike represented time. This helped graphically represent spike trains while preserving all of the data. The following graphs depict visualized data for the eleventh trials of each of Cori’s sessions:
+
+```{r, fig.show="hold", out.width="50%",echo=FALSE,results='hide', cache = TRUE}
+graph_svf(1,11,TRUE)
+graph_svf(2,11,TRUE)
+graph_svf(3,11,TRUE)
+```
+
+We also compared the first trials of the first sessions for each mouse:
+
+```{r, fig.show="hold", out.width="50%",echo=FALSE,results='hide', cache = TRUE}
+graph_svf(1,1,TRUE)
+graph_svf(4,1,TRUE)
+graph_svf(8,1,TRUE)
+graph_svf(12,1,TRUE)
+```
+
+The data shows that the four mice experienced different neural spikes during their first trials. Even throughout progressive sessions for the same mouse, neuronal activity was distinct. We concluded that comparing every trial between sessions would be unrealistically time-consuming. Thus, we created two general graphs representing neuronal activity corresponding to successes and neuronal activity corresponding to failures.
+
+```{r, fig.show="hold", out.width="50%",echo=FALSE,results='hide', cache = TRUE}
+success_svf(1,3)
+success_svf(4,7)
+success_svf(8,11)
+success_svf(12,18)
+success_svf(1,18,TRUE)
+```
+
+Each mouse's exact expression pattern differed, resulting in an unclear distinction between success and failure in the aggregate plots. However, some patterns become immediately apparent. Generally, per mouse, successful trials showed more neuronal activity than failed trials. We found that the absence or presence of certain horizontal “bands” corresponded relatively consistently with success or failure, but these were specific to each mouse. Similar bands were visible in the aggregate success plot but were obscured and indistinct. These comparisons gave us a promising framework for generalizing the neural spike data.
+
+To tentatively confirm this difference, we compared an arbitrary success with an arbitrary failure in Session 4 when the left contrast was 1.0 and the right contrast was 0.
+
+```{r, fig.show="hold", out.width="50%",echo=FALSE,results='hide', cache = TRUE}
+graph_svf(4,94,TRUE)
+graph_svf(4,122,TRUE)
+```
+
+This outcome seemed to corroborate our hypothesis. However, we adjusted our approach to account for the influence of contrast difference. We decided to determine whether more considerable relative differences, in contrast, were strongly correlated with success or failure. By assessing the role of contrast, we believed we could elucidate the relatively muddy data from the overall success and failure plots. First, we tried plotting feedback versus the contrast difference for all sessions.
+
+```{r,echo=FALSE, cache = TRUE}
+svf_fbscs = function(input_series=c(1:18),title_append=""){
+  x_feedback_success = c()
+  y_feedback_success = c()
+  for(i in input_series){
+    for(trial in 1:length((session[[i]]$contrast_left))){
+      contrast_diff = session[[i]]$contrast_left[[trial]]-session[[i]]$contrast_right[[trial]]
+      x_feedback_success = append(x_feedback_success,contrast_diff)
+      y_feedback_success = append(y_feedback_success,session[[i]]$feedback[[trial]])
+    }
+  }
+  plot(y_feedback_success~x_feedback_success,main=paste("Feedback versus Contrast Difference",title_append),xlab="Contrast Difference (Left minus Right)",ylab="Feedback",pch=16,col=alpha("black",0.01))
+}
+svf_fbscs()
+```
+
+This visualization was not very helpful by itself. Thus, we decided to compare feedback versus the contrast difference for Cori’s trials.
+
+```{r, fig.show="hold", out.width="50%",echo=FALSE,results='hide', cache = TRUE}
+svf_fbscs(1,"(Session 1)")
+svf_fbscs(2,"(Session 2)")
+svf_fbscs(3,"(Session 3)")
+```
+
+We found that the frequency of successes versus failures increased as sessions increased, as we discovered earlier with our bar graphs. Furthermore, the frequency of successes versus failures increased as the contrast increased, except for when the right contrast was 1.0.
+
+By making similar graphs for all mice, we determined that this pattern held for every set of first versus last sessions for all mice, especially for more extreme contrast differences.
+
+```{r, fig.show="hold", out.width="50%",echo=FALSE,results='hide', cache = TRUE}
+svf_fbscs(c(1,4,8,12),"(First Sessions)")
+svf_fbscs(c(3,7,11,18),"(Last Sessions)")
+```
+
+When there was no contrast difference, the proportion of successes to failures remained equal, as equal contrasts meant a randomly determined outcome. However, as the difference in contrast increased, the rate of success also increased, especially in later sessions.
+
+After visualizing the general natures of every variable of interest, we decided to determine the extent of the interactions between them. Our exploratory data analyses determined that we had reason to believe there was a correlation between contrast type and success. To verify this, we created neuronal activity graphs for contrast differences 0, 0.5, and 1.
+
+```{r,echo=FALSE, cache = TRUE}
+success_svf_type = function(start_ind, end_ind, contrast_test = 0){
+  x_success = c()
+  y_success = c()
+  x_failure = c()
+  y_failure = c()
+  session_name = session[[start_ind]]$mouse_name
+  for(i in start_ind:end_ind){
+    for(trial in 1:length((session[[i]]$contrast_left))){
+      contrast_diff = session[[i]]$contrast_left[[trial]]-session[[i]]$contrast_right[[trial]]
+      entry = graph_svf(i,trial)
+      if(contrast_diff == contrast_test){
+        if(session[[i]]$feedback_type[[trial]]==1){
+          x_success = append(x_success,entry[[1,1]])
+          y_success = append(y_success,entry[[2,1]])
+        } else {
+          x_failure = append(x_failure,entry[[1,1]])
+          y_failure = append(y_failure,entry[[2,1]])
+        }
+      }
+    }
+  }
+  session_name = paste("Contrast Difference: ",contrast_test,sep="")
+  plot(y_success~x_success,pch=16,col=alpha("black",0.01),main=paste("Successful Trials (",session_name,")",sep=""),ylab="Neuron",xlab="Time")
+  plot(y_failure~x_failure,pch=16,col=alpha("black",0.01),main=paste("Failed Trials (",session_name,")",sep=""),ylab="Neuron",xlab="Time")
+}
+
+```
+
+```{r, fig.show="hold", out.width="50%",echo=FALSE,results='hide', cache = TRUE}
+success_svf_type(1,18,0)
+success_svf_type(1,18,0.5)
+success_svf_type(1,18,1.0)
+```
+
+As we expected, the profundity of the neuronal activity difference for successful versus failed trials was directly related to the contrast difference. This outcome explained the relative lack of difference between the overall plots for successful versus failed trials, as including every contrast difference blurred the data.
+
+From these analyses, we were confident that high neuronal activity generally correlates to a successful outcome when contrasts are extreme. When contrasts are similar, there is a less noticeable difference in neuronal activity between successful and failed trials, with no discernible difference at zero contrast difference.
+
+Out of caution, we determined whether there was a difference in neuronal activity when the right contrast was higher than the left contrast (i.e., a negative difference). We generated one more plot for -1.0 contrast difference.
+
+```{r, fig.show="hold", out.width="50%",echo=FALSE,results='hide', cache = TRUE}
+success_svf_type(1,18,-1.0)
+```
+
+There did not appear to be an immediately noticeable, meaningful difference. The main problem was that while these patterns were easily discernable in the overall visualizations, they did not necessarily hold for individual trials. Furthermore, a handful of successful trials resembled failed trials, especially when the difference in contrast was low. We had to be cautious about these problems when developing a strategy for data integration.
+
+To simplify the data, we decided to see if any particular linear combination of time bin columns explained more variation than others by running a PCA on the neural spike trains. This would streamline the data summarization if any particular rows or columns accounted for significant variation between trials.
+
+```{r,fig.show="hold", out.width="50%",echo=FALSE,results='hide', cache = TRUE, warning=FALSE,message=FALSE}
+matrix_entry = data.frame(session[[1]]$spks[[1]])
+for(i in 1:18){
+  #print(paste("Now beginning Session ",i))
+  for(trial in 1:length(session[[i]]$contrast_left)){
+    if(trial == 1){
+      if(i != 1){
+        matrix_entry = rbindlist(list(data.frame(session[[i]]$spks[[trial]]), matrix_entry))
+      }
+    } else {
+      matrix_entry = rbindlist(list(data.frame(session[[i]]$spks[[trial]]), matrix_entry))
+    }
+    
+  }
+}
+```
+
+```{r,fig.show="hold", out.width="50%",echo=FALSE,results='hide', cache = TRUE}
+column_prcomp = matrix_entry %>% prcomp(center=TRUE,scale=TRUE)
+```
+
+```{r,echo=FALSE,results='hide', cache = TRUE}
+plot(column_prcomp, main="PCA of Spike Columns")
+```
+
+The first principal component was primarily sufficient to explain the variation in the data. This means we could summarize the neural spike data as a single dimension. Therefore, a weighted average of some characteristic of the spike trains would suffice to summarize the spike trains entirely.
+
+Next, we determined whether each column in the PCA was significant to the outcome by finding the rotations for every time bin in the neuron spike trains.
+
+```{r,fig.show="hold",echo=FALSE, cache = TRUE}
+knitr::kable(list(as.matrix(column_prcomp$rotation)[1:20,1],as.matrix(column_prcomp$rotation)[21:40,1]), format = "html") %>% kable_classic(full_width = F, html_font = "Cambria")
+```
+Each rotation was reasonably similar. We concluded that each time bin was equally contributory to the principal component, so we included all of them. This also suggested that the most significant source of variance came from the overall total activity, although particular time bins had more or less impact than other time bins. Because of this, a weighted average became our best candidate for summarizing the neuron spike data.
+
+With a stronger understanding of the interactions within the data set, we were ready to proceed with making the data usable for predictive modeling.
+
+# Data Integration
+
+Our first step in producing usable data was summarizing the spike trains containing neuronal activity into distinct, comparable values. From our exploratory data analysis, the most helpful approach would be representing each spike train as a value representing overall activity, as for individual contrasts, overall activity was the most potent signifier for success or failure.
+
+An initial idea was to use the average number of neurons fired per spike to represent activity. This value appeared relatively stable throughout the whole data set, hence the appearance of easily apparent bands in the visualizations. Doing so would reduce the complicated neural spike data to a single dimension. However, this approach also had several apparent weaknesses discernible from visual inspection. The average number of neurons fired per spike seemed variable between the mice, especially in failed trials. Cori also appeared to have an unusually low average in successful trials compared to the other mice. Finally, this approach did not seem likely to distinguish easily between successful and failed trials when the contrast difference was low.
+
+The overall average neurons firing per time bin was 27.16189. We then calculated this value for successes and failures in the overall data set for various contrast differences in our preliminary comparison. We decided to merge positive and negative contrasts of the same magnitude into the same categories, as we believed that the difference would not significantly affect the accuracy of this rough analysis.
+
+```{r,echo=FALSE}
+average_svf = function(sid, sind){
+  total_spikes = 0
+  svf_input = svf(sid, sind)
+  svf_input = svf_input[[4]]
+  for (column_number in 1:ncol(svf_input)){
+    for (row_number in 1:nrow(svf_input)){
+      if(svf_input[row_number,column_number] == 1) {
+        total_spikes = total_spikes + 1
+      }
+    }
+  }
+  return(total_spikes/ncol(svf_input))
+}
+
+average_svf_total = function(start_ind, end_ind, feedback_test = 1){
+  overall_avger = c()
+  for(i in start_ind:end_ind){
+    for(trial in 1:length((session[[i]]$contrast_left))){
+        if(session[[i]]$feedback[[trial]] == feedback_test){
+        overall_avger = c(overall_avger,average_svf(i,trial))
+      }
+    }
+  }
+  return(mean(overall_avger))
+}
+
+average_svf_total_contrast = function(start_ind, end_ind, feedback_test = 1, contrast_test = 1){
+  overall_avg = c()
+  for(i in start_ind:end_ind){
+    for(trial in 1:length((session[[i]]$contrast_left))){
+      contrast_diff = abs(session[[i]]$contrast_left[[trial]]-session[[i]]$contrast_right[[trial]])
+      if(session[[i]]$feedback[[trial]] == feedback_test & contrast_diff == contrast_test){
+      overall_avg = c(overall_avg,average_svf(i,trial))
+      }
+    }
+  }
+  return(mean(overall_avg))
+}
+```
+
+```{r,echo=FALSE, cache = TRUE}
+contrasts_vec = c(0, 0.25, 0.5, 0.75, 1)
+Difference = c()
+Feedback = c()
+Average = c()
+for(cvec_instance in contrasts_vec){
+  if(cvec_instance != 0){Difference = c(Difference,cvec_instance,"")}
+  else{Difference = c(Difference,cvec_instance,"")}
+  Feedback = c(Feedback,"Success","Failure")
+  Average = c(Average,average_svf_total_contrast(1,18,1,cvec_instance),average_svf_total_contrast(1,18,-1,cvec_instance))
+}
+final_df_average = data.frame(Difference,Feedback,Average)
+knitr::kable(final_df_average, format = "html") %>% kable_classic(full_width = F, html_font = "Cambria")
+```
+
+This finding partially confirmed our predictions about using this value to summarize neural activity between contrasts. However, the pattern did not hold when the contrast difference was 0. This result was still within our expectations, as when the contrast was 0, the correct outcome was randomly decided. We continued to assess the weaknesses of our initially chosen metric by finding these values for each mouse.
+
+```{r,echo=FALSE, cache = TRUE}
+final_df_average = data.frame(
+  Mouse = c("Cori","","Forssmann","","Hench","","Lederberg",""),
+  Feedback = c("Success","Failure","Success","Failure","Success","Failure","Success","Failure"),
+  Average = c(average_svf_total(1,3),average_svf_total(1,3,-1),average_svf_total(4,7),average_svf_total(4,7,-1),average_svf_total(8,11),average_svf_total(8,11,-1),average_svf_total(12,18),average_svf_total(12,18,-1))
+  
+)
+knitr::kable(final_df_average, format = "html") %>% kable_classic(full_width = F, html_font = "Cambria")
+```
+
+Our prediction about the value differing between each mouse was also correct. We were unsure whether this was due to a difference in responses between the mice, between contrast differences in the trials, or some other factor. Regardless, we were now ready to include the coefficients we found in our PCA. to produce a special weighted average. Thus, we found averages as we did above using the same categories, but we applied the appropriate PCA weights to each time bin.
+
+```{r,echo=FALSE}
+average_svf_pca = function(sid, sind){
+  total_spikes = 0
+  svf_input = svf(sid, sind)
+  svf_input = svf_input[[4]]
+  for (column_number in 1:ncol(svf_input)){
+    for (row_number in 1:nrow(svf_input)){
+      if(svf_input[row_number,column_number] == 1) {
+        total_spikes = total_spikes + column_prcomp$rotation[column_number,1]
+      }
+    }
+  }
+  return(total_spikes/(ncol(svf_input)*sum(column_prcomp$rotation[,1])))
+}
+
+average_svf_total_pca = function(start_ind, end_ind, feedback_test = 1){
+  overall_avger = c()
+  for(i in start_ind:end_ind){
+    for(trial in 1:length((session[[i]]$contrast_left))){
+        if(session[[i]]$feedback[[trial]] == feedback_test){
+        overall_avger = c(overall_avger,average_svf_pca(i,trial))
+      }
+    }
+  }
+  return(mean(overall_avger))
+}
+
+average_svf_total_contrast_pca = function(start_ind, end_ind, feedback_test = 1, contrast_test = 1){
+  overall_avg = c()
+  for(i in start_ind:end_ind){
+    for(trial in 1:length((session[[i]]$contrast_left))){
+      contrast_diff = abs(session[[i]]$contrast_left[[trial]]-session[[i]]$contrast_right[[trial]])
+      if(session[[i]]$feedback[[trial]] == feedback_test & contrast_diff == contrast_test){
+      overall_avg = c(overall_avg,average_svf_pca(i,trial))
+      }
+    }
+  }
+  return(mean(overall_avg))
+}
+```
+
+
+```{r,echo=FALSE, cache = TRUE}
+contrasts_vec = c(0, 0.25, 0.5, 0.75, 1)
+Difference = c()
+Feedback = c()
+Average = c()
+for(cvec_instance in contrasts_vec){
+  if(cvec_instance != 0){Difference = c(Difference,cvec_instance,"")}
+  else{Difference = c(Difference,cvec_instance,"")}
+  Feedback = c(Feedback,"Success","Failure")
+  Average = c(Average,average_svf_total_contrast_pca(1,18,1,cvec_instance),average_svf_total_contrast_pca(1,18,-1,cvec_instance))
+}
+final_df_average = data.frame(Difference,Feedback,Average)
+knitr::kable(final_df_average, format = "html") %>% kable_classic(full_width = F, html_font = "Cambria")
+```
+
+We found that the outcome followed the same pattern. This data served as a good summary of the spike train columns.  However, because the 0 contrast difference tests had randomly chosen outcomes, we believed they polluted our data. This was corroborated by the failure of the 0 contrast difference averages to adhere to the pattern. To rectify this, we removed all trials where the contrast difference was zero from the training data. After doing so, we recalculated the PCA coefficients using the new data set.
+
+```{r,echo=FALSE,cache=TRUE}
+matrix_entry = data.frame(session[[1]]$spks[[1]])
+for(i in 1:18){
+  #print(paste("Now beginning Session ",i))
+  for(trial in 1:length(session[[i]]$contrast_left)){
+    if(abs(session[[i]]$contrast_left[[trial]]-session[[i]]$contrast_right[[trial]]) != 0){
+      if(trial == 1){
+        if(i != 1){
+          matrix_entry = rbindlist(list(data.frame(session[[i]]$spks[[trial]]), matrix_entry))
+        }
+      } else {
+        matrix_entry = rbindlist(list(data.frame(session[[i]]$spks[[trial]]), matrix_entry))
+      }
+    }
+  }
+}
+column_prcomp = matrix_entry %>% prcomp(center=TRUE,scale=TRUE)
+plot(column_prcomp, main="Adjusted PCA of Spike Columns")
+```
+
+We did not need to redesign our model because there was no change in the number of significant principal components. Using the new coefficients, we calculated the averages for each contrast.
+
+```{r,echo=FALSE, cache = TRUE}
+# Cache Test
+contrasts_vec = c(0, 0.25, 0.5, 0.75, 1)
+Difference = c()
+Feedback = c()
+feedback_numerical = c()
+Average = c()
+for(cvec_instance in contrasts_vec){
+  if(cvec_instance != 0){Difference = c(Difference,cvec_instance,"")}
+  else{Difference = c(Difference,cvec_instance,"")}
+  Feedback = c(Feedback,"Success","Failure")
+  Average = c(Average,average_svf_total_contrast_pca(1,18,1,cvec_instance),average_svf_total_contrast_pca(1,18,-1,cvec_instance))
+}
+final_df_average = data.frame(Difference,Feedback,Average)
+knitr::kable(final_df_average, format = "html") %>% kable_classic(full_width = F, html_font = "Cambria")
+```
+
+The rotations were very similar overall to the original PCA. The averages generally increased compared to the originally calculated averages for successes and failures. However, successes saw a more significant increase than failures did, and when the contrast difference was 1, the average decreased. Removing the 0 contrast difference trials slightly improved the usefulness of our data.
+
+We were also interested in summarizing the spike train rows. We could not use PCA for this task, as the number of rows varied between trials. Therefore, we needed a different approach. Returning to observations made in exploratory data analysis, failed trials tended to have more obvious horizontal bands than successful trials, although this distinction homogenized as the contrast difference decreased. These bands also seemed relatively stable horizontally. Thus, we correspondingly altered our approach in summarizing the spike trains. With some manipulation, we could create a mathematical function that produced a value representing the banding density of a given spike train. Ideally, this function would result in higher values when the horizontals of a given spike train had less uniform densities. The goal was to produce a horizontal summary of the neural spike data that we could compare against the vertical summary that the average neuron spikes per time bin provided.
+
+After some experimentation, we arrived at the following function to generate a “band density score” representing how unevenly distributed the spikes within a spike train were:
+$$Density = {{\sum{}^{}{(x^2+y^2)}}\over{N^2}}$$
+
+Where x was the weighted total number of times a given neuron fired in a time bin, y was the weighted total number of times a given neuron didn’t fire in a time bin, and N was the total number of times neurons fired in a time bin. The equation had several valuable properties: the same neuron firing multiple times results in a larger value than different neurons firing the same number of times, evenly spread spike trains are penalized by the denominator, and sparsely populated rows are rewarded by the n term. 
+
+We tested this on five simple, unweighted cases to ensure the function behaved as intended: a 6x6 grid filled with spikes, a 6x6 grid with three rows of spikes and three empty rows, a 6x6 checkerboard grid with the same number of spikes as the second grid, a 10x10 grid filled with spikes, and a 10x10 grid with five rows of spikes and five empty rows. The corresponding density scores were 0.16667, 0.66667, 0.33333, 0.1, and 0.4. We expected this outcome; the filled grids (analogous to successful trials) had the lowest scores (0.16667 and 0.1). The unfilled grid with no bands (which we included as a control) had a lower score than the grids with bands but a higher score than the filled grids (0.33333). Finally, the grids with alternatingly filled and empty rows (analogous to failed trials) had high scores (0.66667 and 0.4).
+
+We proceeded to test whether it accurately reflected the data. Thus, we found the average density of the same categories as for average neuron activity.
+
+```{r,echo=FALSE, cache = TRUE}
+svf_density = function(sid, sind){
+  density_sum = 0
+  total_spikes = 0
+  svf_input = svf(sid, sind)
+  svf_input = svf_input[[4]]
+  for (row_number in 1:nrow(svf_input)){
+    totally_spikes = 0
+    totally_spikeless = 0
+    for (col_number in 1:ncol(svf_input)){
+      if(svf_input[row_number,col_number] == 1) {
+        total_spikes = total_spikes + 1
+        totally_spikes = totally_spikes + column_prcomp$rotation[col_number,1]
+      }
+      else {
+        totally_spikeless = totally_spikeless + column_prcomp$rotation[col_number,1]
+      }
+    }
+    density_sum = density_sum + (totally_spikes * totally_spikes) + (totally_spikeless * totally_spikeless)
+  }
+  return(density_sum / total_spikes / total_spikes)
+}
+
+average_svf_density = function(start_ind, end_ind, feedback_test = 1, contrast_test = 1){
+  overall_avg = c()
+  for(i in start_ind:end_ind){
+    for(trial in 1:length(session[[i]]$contrast_left)){
+      contrast_diff = abs(session[[i]]$contrast_left[[trial]]-session[[i]]$contrast_right[[trial]])
+      if(session[[i]]$feedback[[trial]] == feedback_test & contrast_diff == contrast_test){
+      overall_avg = c(overall_avg,svf_density(i,trial))
+      }
+    }
+  }
+  return(mean(overall_avg))
+}
+```
+
+```{r,echo=FALSE,cache=TRUE}
+#Cache test
+contrasts_vec = c(0, 0.25, 0.5, 0.75, 1)
+Difference = c()
+Feedback = c()
+Density = c()
+for(cvec_instance in contrasts_vec){
+  if(cvec_instance != 0){Difference = c(Difference,cvec_instance,"")}
+  else{Difference = c(Difference,cvec_instance,"")}
+  Feedback = c(Feedback,"Success","Failure")
+  Density = c(Density,average_svf_density(1,18,1,cvec_instance),average_svf_density(1,18,-1,cvec_instance))
+}
+final_df_density = data.frame(Difference,Feedback,Density)
+knitr::kable(final_df_density, format = "html") %>% kable_classic(full_width = F, html_font = "Cambria")
+```
+
+This function followed a similar pattern to the average neuron activity. As expected, failed trials generally had higher density scores than successful trials due to the presence of visible bands. Furthermore, like the average neuron activity, the pattern was reversed when the contrast difference was 0.
+
+Overall, having produced several consistently acting single values summarizing the spike train data, we were ready to proceed to model selection and design.
+
+# Predictive Modeling
+Our preliminary approach was to fit a logistic model to our data, including every parameter. Our variable of interest was binary, as feedback could be successful or unsuccessful. Therefore, a logistic model would be most suitable for our initial experimentation. A logistic model is typically a good choice when the outcome is binary and we have several quantitative variables. Theoretically, if this unadjusted model explained the data well enough, we could proceed to model performance immediately. In practice, we likely needed to do some tuning.
+
+```{r,echo=FALSE,cache=TRUE}
+overall_diff = c()
+overall_avg = c()
+overall_dens = c()
+overall_feed = c()
+for(i in 1:18){
+  for(trial in 1:length((session[[i]]$contrast_left))){
+    contrast_diff = abs(session[[i]]$contrast_left[[trial]]-session[[i]]$contrast_right[[trial]])
+    if(contrast_diff != 0){
+      overall_diff = c(overall_diff,contrast_diff)
+      overall_avg = c(overall_avg,average_svf_pca(i,trial))
+      overall_dens = c(overall_dens,svf_density(i,trial))
+      if(session[[i]]$feedback_type[[trial]] == -1) {
+        overall_feed = c(overall_feed,0)
+      } else {
+        overall_feed = c(overall_feed,1)
+      }
+    }
+  }
+}
+merged_dataset = data.frame(overall_feed,overall_avg,overall_dens,overall_diff)
+```
+```{r, echo=FALSE, cache=TRUE}
+overall_diff = c()
+overall_avg = c()
+overall_dens = c()
+overall_feed = c()
+for(i in 1:18){
+  for(trial in 1:length((session[[i]]$contrast_left))){
+    contrast_diff = abs(session[[i]]$contrast_left[[trial]]-session[[i]]$contrast_right[[trial]])
+    overall_diff = c(overall_diff,contrast_diff)
+    overall_avg = c(overall_avg,average_svf_pca(i,trial))
+    overall_dens = c(overall_dens,svf_density(i,trial))
+      if(session[[i]]$feedback_type[[trial]] == -1) {
+        overall_feed = c(overall_feed,0)
+      } else {
+        overall_feed = c(overall_feed,1)
+      }
+    }
+}
+full_dataset = data.frame(overall_feed,overall_avg,overall_dens,overall_diff)
+```
+```{r, echo=FALSE,cache=TRUE}
+model_one = glm(overall_feed~overall_avg+overall_dens+overall_diff,data=merged_dataset,family="binomial")
+```
+```{r, echo=FALSE, cache=TRUE}
+prediction_set = predict(model_one,merged_dataset)
+prediction_set2 = predict(model_one,full_dataset)
+```
+```{r, echo=FALSE, cache=TRUE}
+total_count = 0
+success_count = 0
+for(entry in merged_dataset$overall_feed) {
+  total_count = total_count + 1
+  if(entry==1){
+    if(prediction_set[[total_count]] >= 0.5) {
+      success_count = success_count + 1
+    }
+  } else {
+      if(prediction_set[[total_count]] < 0.5) {
+        success_count = success_count + 1
+    }
+  }
+}
+merged_success_rate = 100*success_count/total_count
+total_count = 0
+success_count = 0
+for(entry in full_dataset$overall_feed) {
+  total_count = total_count + 1
+  if(entry==1){
+    if(prediction_set2[[total_count]] >= 0.5) {
+      success_count = success_count + 1
+    }
+  } else {
+      if(prediction_set2[[total_count]] < 0.5) {
+        success_count = success_count + 1
+    }
+  }
+}
+full_success_rate = 100*success_count/total_count
+```
+
+The coefficients and variances for our model were as follows:
+```{r,echo=FALSE, cache=TRUE}
+model_coef = summary(model_one)$coefficients[,1:2]
+row.names(model_coef) = c("Intercept","Average","Density","Contrast Difference")
+knitr::kable(model_coef, format="html") %>% kable_classic(full_width = F, html_font = "Cambria")
+```
+These coefficients generally met our expectations. Average neuronal activity was positively associated with success, a high density score was negatively associated with success, and a high contrast difference was positively associated with success. We concluded that we were on the right track. For a precursory analysis of our model, we evaluated how accurately the model predicted its own training data. This risked overfitting the data and producing a higher accuracy than the true value, but we believed it was more or less suitable for simple diagnostic purposes. Either way, we would later evaluate the true model accuracy using a proper test data set removed from the training data. Thus, we created a confusion matrix depicting the model accuracy with the preliminary test data set (left) and the full data set (right).
+```{r, fig.show="hold",echo=FALSE, cache = TRUE}
+#3
+knitr::kable(list(table(Predicted = ifelse(prediction_set > 0.5, "Success", "Failure"),Actual = merged_dataset$overall_feed), table(Predicted = ifelse(prediction_set2 > 0.5, "Success", "Failure"),Actual = full_dataset$overall_feed)),format="html") %>% kable_classic(full_width = F, html_font = "Cambria")
+```
+
+We found that the model had a `r 100-merged_success_rate`% misclassification rate on the preliminary test set and a `r 100-full_success_rate`% misclassification rate on the complete data set. Furthermore, the confusion matrices showed that the model tended to overpredict successes. The higher misclassification rate on the complete data set was expected, as the model would have at most 50% accuracy for trials with zero contrast difference due to previously discussed reasons. The logistic model's accuracy was fairly consistent, although we could not claim anything about its accuracy without using the test data set.
+
+We then proceeded to tighten the logistic model accuracy using cross-validation. This would help minimize the risk of overfitting and restrict our model to important parameters. The coefficients are reported below.
+
+```{r, echo=FALSE,cache=TRUE}
+model_tone = cv.glmnet(y=merged_dataset$overall_feed,as.matrix(merged_dataset[,c(2:4)]),family="binomial")
+knitr::kable(as.matrix(coef(model_one, s = "lambda.min")), format = "html",col.names=c("Coefficient")) %>% kable_classic(full_width = F, html_font = "Cambria")
+```
+
+Our optimal tuning parameter was `r model_tone$lambda.min`. As demonstrated by the coefficients, all selected parameters contributed to the optimized model. Furthermore, the same pattern correlating each variable to success or failure was present within this model as was in the model without cross-validation. Judging from the intercept, the cross-validated model seemed more predisposed to classifying trials as successes, putting less weight on the other parameters in general. As with the model without cross-verification, we looked at its ability to explain its own training data.
+
+```{r, echo=FALSE, cache=TRUE}
+prediction_set = predict(model_tone,as.matrix(merged_dataset[,c(2:4)]))
+prediction_set2 = predict(model_tone,as.matrix(full_dataset[,c(2:4)]))
+```
+```{r, echo=FALSE, cache=TRUE}
+total_count = 0
+success_count = 0
+for(entry in merged_dataset$overall_feed) {
+  total_count = total_count + 1
+  if(entry==1){
+    if(prediction_set[[total_count]] >= 0.5) {
+      success_count = success_count + 1
+    }
+  } else {
+      if(prediction_set[[total_count]] < 0.5) {
+        success_count = success_count + 1
+    }
+  }
+}
+merged_success_rate = 100*success_count/total_count
+total_count = 0
+success_count = 0
+for(entry in full_dataset$overall_feed) {
+  total_count = total_count + 1
+  if(entry==1){
+    if(prediction_set2[[total_count]] >= 0.5) {
+      success_count = success_count + 1
+    }
+  } else {
+      if(prediction_set2[[total_count]] < 0.5) {
+        success_count = success_count + 1
+    }
+  }
+}
+full_success_rate = 100*success_count/total_count
+```
+```{r, fig.show="hold",echo=FALSE, cache = TRUE}
+#3
+knitr::kable(list(table(Predicted = ifelse(prediction_set > 0.5, "Success", "Failure"),Actual = merged_dataset$overall_feed), table(Predicted = ifelse(prediction_set2 > 0.5, "Success", "Failure"),Actual = full_dataset$overall_feed)),format="html") %>% kable_classic(full_width = F, html_font = "Cambria")
+```
+Unfortunately, it appeared that cross-validation resulted in a very strong bias towards classifying trials as successes, with no trials being classified as failures. Thus, assuming we continued with a logistic model, we believed it would make more sense to predict new data using the model without cross-validation.
+
+We also considered using linear discriminant analysis (LDA) and k nearest neighbors (kNN) models, but decided against the kNN model for reasons inherent to the data set. Due to the relatively large quantity of successful trials compared to failed trials, a kNN model would likely disproportionately classify failures as successes. From this reasoning, we could also discount simpler predictive models like tree models. We proceeded with fitting an LDA model to the data.
+
+Our group-specific means were as follows, where 0 represented failed trials and 1 represented successful trials.
+```{r, fig.show="hold",echo=FALSE, cache = TRUE}
+linear_disc = lda(overall_feed~overall_avg+overall_dens+overall_diff,data=merged_dataset)
+knitr::kable(linear_disc$means, format = "html",col.names=c("Average","Density","Difference")) %>% kable_classic(full_width = F, html_font = "Cambria")
+```
+Again, as expected, successful trials had a higher average activity and contrast difference than failed trials, with a higher density score. Like our initial logistic model, we looked at confusion matrices for the preliminary and complete test data sets. Like before, the left confusion matrix was for the preliminary test data set, and the right confusion matrix was for the entire data set.
+```{r, echo=FALSE, cache=TRUE}
+prediction_set = predict(linear_disc,merged_dataset)
+prediction_set2 = predict(linear_disc,full_dataset)
+```
+
+```{r, fig.show="hold",echo=FALSE, cache = TRUE}
+#3
+knitr::kable(list(table(Predicted = prediction_set$class,Actual = merged_dataset$overall_feed), table(Predicted = prediction_set2$class,Actual = full_dataset$overall_feed)),format="html") %>% kable_classic(full_width = F, html_font = "Cambria")
+```
+Our respective misclassification error rates on the training data were `r 100-(100*(13+2533))/(13+15+834+2533)`% and `r 100-(100*(49+3524))/(49+84+1424+3524)`%. This was a slightly better performance than our logistic model, though again, it was only helpful in determining model consistency and not model accuracy. Like before, the model tended to overpredict successes, although the LDA model was less likely to classify successful trials as failed. We decided on the logistic model without cross-validation between these two models, as it appeared less likely to overpredict successes than the LDA model. Because success overprediction was the most significant weakness in our model, we chose to proceed with the model that would minimize it.
+
+# Model Performance
+We assessed the model with 100 trials removed from Sessions 1 and 18, for 200 trials total. Accuracy was determined on whether the model, for a given trial's spike train data and contrast input, would successfully predict the feedback type. We assessed two metrics for accuracy: overall accuracy and accuracy discounting trials where the contrast difference was 0. This is because when there was no difference between left and right contrast, the feedback was randomly determined and independent of the mouse's neural processes. Therefore, regardless of the model's true accuracy, the expected accuracy would be at most 50% for trials where the contrast difference was zero. 
+
+These two values had utility in different contexts: the overall predictive accuracy would tell us how accurately the model could predict feedback given input data, and the adjusted predictive accuracy would tell how accurately the model associates input data types to specific feedback types. In other words, the total accuracy represented how well the model predicted new feedback given new spike trains and contrasts. In contrast, the adjusted accuracy represented how well the model explained the connection between spike train data, contrasts, and feedback. As we did with preliminary testing, we constructed confusion matrices for our predictions, with the left corresponding to the reduced data set and the right corresponding to the full data set.
+
+```{r, echo=FALSE, cache=TRUE}
+test_dataset = c()
+for(i in 1:2){
+  test_dataset[[i]] = readRDS(paste('./test',i,'.rds',sep=''))
+}
+```
+```{r,echo=FALSE,cache=TRUE}
+overall_diff = c()
+overall_avg = c()
+overall_dens = c()
+overall_feed = c()
+for(i in 1:2){
+  for(trial in 1:length((test_dataset[[i]]$contrast_left))){
+    contrast_diff = abs(test_dataset[[i]]$contrast_left[[trial]]-test_dataset[[i]]$contrast_right[[trial]])
+    if(contrast_diff != 0){
+      overall_diff = c(overall_diff,contrast_diff)
+      overall_avg = c(overall_avg,average_svf_pca(i,trial))
+      overall_dens = c(overall_dens,svf_density(i,trial))
+      if(test_dataset[[i]]$feedback_type[[trial]] == -1) {
+        overall_feed = c(overall_feed,0)
+      } else {
+        overall_feed = c(overall_feed,1)
+      }
+    }
+  }
+}
+merged_final_dataset = data.frame(overall_feed,overall_avg,overall_dens,overall_diff)
+```
+```{r, echo=FALSE, cache=TRUE}
+overall_diff = c()
+overall_avg = c()
+overall_dens = c()
+overall_feed = c()
+for(i in 1:2){
+  for(trial in 1:length((test_dataset[[i]]$contrast_left))){
+    contrast_diff = abs(test_dataset[[i]]$contrast_left[[trial]]-test_dataset[[i]]$contrast_right[[trial]])
+    overall_diff = c(overall_diff,contrast_diff)
+    overall_avg = c(overall_avg,average_svf_pca(i,trial))
+    overall_dens = c(overall_dens,svf_density(i,trial))
+      if(test_dataset[[i]]$feedback_type[[trial]] == -1) {
+        overall_feed = c(overall_feed,0)
+      } else {
+        overall_feed = c(overall_feed,1)
+      }
+    }
+}
+full_final_dataset = data.frame(overall_feed,overall_avg,overall_dens,overall_diff)
+```
+```{r, echo=FALSE, cache=TRUE}
+prediction_set = predict(model_one,merged_final_dataset)
+prediction_set2 = predict(model_one,full_final_dataset)
+knitr::kable(list(table(Predicted = ifelse(prediction_set > 0.5, "Success", "Failure"),Actual = merged_final_dataset$overall_feed), table(Predicted = ifelse(prediction_set2 > 0.5, "Success", "Failure"),Actual = full_final_dataset$overall_feed)),format="html") %>% kable_classic(full_width = F, html_font = "Cambria")
+```
+Despite the model selection process, our model still overpredicted successes in the testing data to the extent that it predicted all of the trials as successes. This corresponded to a misclassification error rate of `r 100-100*(106/148)`% in the data set excluding trials with zero contrast difference and a misclassification error rate of `r 100-100*(145/200)`% in the entire test data set. Thus, our predicative accuracy for deterministic trials was `r 100*(106/148)`% and `r 100*(145/200)`% for all trials. While this accuracy appears good in a vacuum, in the context of the test data set, it was because the majority of the trials in the test data set were successes.
+
+# Discussion
+Thus, our model was fairly accurate, but we had reservations about our results The most apparent weakness for model selection and evaluation against a test data set was the overprediction of successes. In future designs, there are several steps we could take to minimize this. For example, more carefully curating the training data could improve model accuracy. We could reduce the inherent bias towards successful trials by ensuring a relatively equal representation between successful and failed trials. Furthermore, we could include only trials from later sessions for each mouse, as successes from those trials are potentially more attributable to decision-making learned from previous trials. For a similar reason, our model was likely a poor fit for all of the Session 1 test trials, as Session 1 was the first session for one of the mice and thus the mouse would not have developed as strong of a connection between the visual stimuli and the correct action. A larger pool of test trials taken from every session could increase the demonstrated accuracy of our model.
+
+In a broader scope, our results show that with neural spike train data and visual contrasts, designing and training a model that predicted how a mouse reacted in experimental trials was possible. Specifically, our model was a rudimentary simulation of the neural processes of mice undertaking visual-spatial decision-making. Given a new set of contrasts and neural activity, we can predict how a mouse reacted in a given experimental trial. We found that the exact neural activity in trials differed between mice. Still, neuron firing frequency and density (whether a small number of neurons accounted for most of the neural spikes) were consistent signifiers for whether or not a mouse succeeded in any given trial. This was possible because the success to contrast difference ratio indicated that the mice could make informed decisions given two different contrasts. Therefore, we could design and train a model that emulated this decision-making process.
+
+This outcome suggests that designing more complex models to simulate neurological responses to more varied stimuli would be a promising candidate for further analysis. In doing so, we could determine broader connections between specific expressions of neural activity versus sensory information. The resulting patterns could help explain neurological processes in mice. They could simplify the inner workings of a reasonably intelligent (i.e., capable of problem-solving given visual stimuli) brain at a neuronal level. For this specific experiment, another possible avenue for continued research would be focusing on how neuron spike train expression changes across experimental sessions for each mouse. This could help us understand how the process of learning changes neural pathways. Depending on the outcome, it could also demonstrate how individual mice could develop the same decision-making skills based on different neural pathway changes. Further research would be valuable to cognitive science and neuroscience in both cases. 
+
+# References
+Steinmetz, N.A., Zatka-Haas, P., Carandini, M. et al. Distributed coding of choice, action and engagement across the mouse brain. Nature 576, 266–273 (2019). https://doi.org/10.1038/s41586-019-1787-x
+
+\clearpage
+
+\hrulefill
+
+\begin{center} Appendix: R Script \end{center}
+
+# Appendix: R Code
+
+```{r, ref.label=knitr::all_labels(),echo=TRUE,eval=FALSE}
+```
